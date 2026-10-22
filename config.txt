@@ -1,7 +1,7 @@
 {
   "version": 1,
   "created_at": "2026-10-22T10:28:19.113140",
-  "last_sync": "2026-10-22T11:11:51.108818",
+  "last_sync": "2026-10-22T11:12:33.182035",
   "tg_tokens": [],
   "ig_ids": [
     {
@@ -79,12 +79,12 @@
       "gc_name": "\u3018\ud83c\udf40\u3019\u200e\ud80c\udc83\ud835\udd84\u028a\u1d1b\uaadd\ud80c\udc83\u16d5\uaac0\u0274\u0262\ud80c\udc83H\uaadd\u026a\ud80c\udc83\u3018\ud83c\udf40\u3019",
       "text": ".nyny abto teri ma 5 bje hi mregi \ud83d\ude18",
       "running": true,
-      "proxy": "http://168.253.92.93:10808",
+      "proxy": "http://103.31.232.110:8080",
       "added_at": "2026-10-22T11:10:43.487338",
       "stats": {
         "sent": 0,
-        "errors": 3,
-        "last_send": "2026-10-22T11:11:51.107941"
+        "errors": 4,
+        "last_send": "2026-10-22T11:12:33.180953"
       }
     }
   ],
