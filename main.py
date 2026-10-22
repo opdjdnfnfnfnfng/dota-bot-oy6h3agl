@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import sys, os, subprocess, importlib, asyncio, json, base64, re, secrets, string, random, warnings, time
+import sys, os, subprocess, importlib, asyncio, json, base64, re, secrets, string, random, warnings, time, html
 from datetime import datetime
 
 warnings.filterwarnings("ignore", category=UserWarning, module="telegram.ext.conversationhandler")
@@ -28,7 +28,8 @@ from telegram.ext import (
 from instagrapi import Client as IGClient
 from instagrapi.exceptions import (
     TwoFactorRequired, ChallengeRequired, BadPassword, UserNotFound,
-    RateLimitError, LoginRequired, PleaseWaitFewMinutes
+    RateLimitError, LoginRequired, PleaseWaitFewMinutes, ClientError,
+    ClientForbiddenError
 )
 
 # ================= HARDCODED =================
@@ -45,6 +46,7 @@ MAIN_FILE        = "main.py"
 GITHUB_API       = "https://api.github.com"
 MAX_IG_PER_USER  = 4
 MAX_TG_PER_USER  = 2
+MAX_IG_PER_PROXY = 2
 
 S_TG_TOKEN, S_IG_USER, S_IG_PASS, S_IG_2FA, S_IG_TEXT = range(5)
 S_ADD_BOT, S_BROADCAST = range(5, 7)
@@ -68,18 +70,70 @@ PROXY_SOURCES = [
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
 ]
 
+# ================= HELPERS =================
+def esc(s):
+    if s is None:
+        return ""
+    return html.escape(str(s))
+
+def is_valid_token(token):
+    if not token or ":" not in token:
+        return False
+    try:
+        bot_id, auth = token.split(":", 1)
+        return bot_id.isdigit() and len(auth) >= 30
+    except Exception:
+        return False
+
+def make_safe_ig_client():
+    cl = IGClient()
+    def _no_prompt(*args, **kwargs):
+        return None
+    for attr in ("challenge_code_handler", "change_password_handler",
+                 "two_factor_handler", "verification_code_handler",
+                 "totp_code_handler"):
+        try:
+            setattr(cl, attr, _no_prompt)
+        except Exception:
+            pass
+    return cl
+
+def cleanup_session_files():
+    import glob
+    for pattern in ("session_*.json", "*.session", "settings_*.json"):
+        for f in glob.glob(pattern):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+
+def is_network_error(e):
+    msg = str(e).lower()
+    keywords = (
+        "proxy", "connect", "timeout", "tunnel", "connection reset",
+        "read timed out", "connecterror", "proxyerror", "remotedisconnected",
+        "10054", "10060", "eof occurred", "ssl", "unreachable"
+    )
+    return any(k in msg for k in keywords)
+
+async def safe_edit(q, text, reply_markup=None, parse_mode="HTML"):
+    try:
+        await q.message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except Exception:
+        try:
+            await q.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        except Exception:
+            pass
 
 # ================= CONFIG =================
 def default_config():
     return {
-        "version": 3, "last_sync": None,
+        "version": 4, "last_sync": None,
         "github_user": "", "github_repo": "",
         "bots": [], "users": {}, "ig_ids": []
     }
 
-
 def load_config():
-    """Load with merge + type validation — handles old schema safely."""
     global CONFIG
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -92,27 +146,20 @@ def load_config():
     if not isinstance(loaded, dict):
         loaded = {}
 
-    # Merge with defaults
     base = default_config()
     for key, default_val in base.items():
         if key not in loaded:
             loaded[key] = default_val
 
-    # Type validation
     if not isinstance(loaded.get("bots"), list):
         loaded["bots"] = []
     if not isinstance(loaded.get("ig_ids"), list):
         loaded["ig_ids"] = []
     if not isinstance(loaded.get("users"), dict):
         loaded["users"] = {}
-    if not isinstance(loaded.get("github_user"), str):
-        loaded["github_user"] = ""
-    if not isinstance(loaded.get("github_repo"), str):
-        loaded["github_repo"] = ""
 
     CONFIG = loaded
     save_config()
-
 
 def save_config():
     global GH_DIRTY
@@ -124,18 +171,27 @@ def save_config():
     except Exception:
         pass
 
+def save_stats_only():
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(CONFIG, f, indent=2)
+    except Exception:
+        pass
 
 def user_tg_count(uid):
     return len([b for b in CONFIG["bots"] if b.get("owner_id") == uid and not b.get("is_main")])
 
-
 def user_ig_count(uid):
     return len([ig for ig in CONFIG["ig_ids"] if ig["owner_id"] == uid])
-
 
 def get_owner_tg_bots(uid):
     return [b for b in CONFIG["bots"] if b.get("owner_id") == uid and not b.get("is_main")]
 
+def find_owner_app(uid):
+    for b in CONFIG["bots"]:
+        if b.get("owner_id") == uid and b["token"] in TG_APPS:
+            return TG_APPS[b["token"]]
+    return None
 
 # ================= GITHUB =================
 async def gh_get(session, path):
@@ -145,7 +201,6 @@ async def gh_get(session, path):
     except Exception as e:
         return None, str(e)
 
-
 async def gh_post(session, path, payload):
     try:
         async with session.post(f"{GITHUB_API}{path}", json=payload, timeout=15) as r:
@@ -153,14 +208,12 @@ async def gh_post(session, path, payload):
     except Exception as e:
         return None, str(e)
 
-
 async def gh_put(session, path, payload):
     try:
         async with session.put(f"{GITHUB_API}{path}", json=payload, timeout=15) as r:
             return r.status, await r.text()
     except Exception as e:
         return None, str(e)
-
 
 async def gh_push_file(session, path, content, msg="auto"):
     try:
@@ -174,6 +227,14 @@ async def gh_push_file(session, path, content, msg="auto"):
     except Exception:
         return False
 
+async def gh_pull_file(session, path):
+    try:
+        status, body = await gh_get(session, f"/repos/{GITHUB_USER}/{REPO_NAME}/contents/{path}")
+        if status == 200:
+            return base64.b64decode(json.loads(body)["content"]).decode("utf-8")
+    except Exception:
+        pass
+    return None
 
 async def gh_bootstrap():
     global GITHUB_USER, REPO_NAME, GH_SESSION
@@ -185,10 +246,6 @@ async def gh_bootstrap():
         if CONFIG.get("github_user") and CONFIG.get("github_repo"):
             GITHUB_USER = CONFIG["github_user"]
             REPO_NAME = CONFIG["github_repo"]
-        elif GITHUB_USER and REPO_NAME:
-            CONFIG["github_user"] = GITHUB_USER
-            CONFIG["github_repo"] = REPO_NAME
-            save_config()
         else:
             status, body = await gh_get(GH_SESSION, "/user")
             if status != 200:
@@ -201,14 +258,12 @@ async def gh_bootstrap():
             save_config()
             await asyncio.sleep(1)
 
-        # Push config
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 await gh_push_file(GH_SESSION, CONFIG_FILE, f.read(), "config")
         except Exception:
             pass
 
-        # Push main (redacted)
         try:
             with open(__file__, "r", encoding="utf-8") as f:
                 mc = f.read()
@@ -220,7 +275,6 @@ async def gh_bootstrap():
     except Exception as e:
         print(f"[GH] {type(e).__name__}: {e}")
 
-
 async def gh_sync_loop():
     global GH_DIRTY
     while not STOP_FLAG:
@@ -229,6 +283,7 @@ async def gh_sync_loop():
             if not GH_SESSION or not GITHUB_USER:
                 continue
 
+            # Push if dirty
             if GH_DIRTY:
                 try:
                     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -237,9 +292,24 @@ async def gh_sync_loop():
                         GH_DIRTY = False
                 except Exception:
                     pass
+
+            # Pull ONLY if no active IG tasks (Bug #26 fix - prevent config race)
+            if not IG_TASKS:
+                remote_text = await gh_pull_file(GH_SESSION, CONFIG_FILE)
+                if remote_text:
+                    try:
+                        rjson = json.loads(remote_text)
+                        remote_ts = rjson.get("last_sync") or ""
+                        local_ts = CONFIG.get("last_sync") or ""
+                        if remote_ts > local_ts:
+                            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                                f.write(remote_text)
+                            load_config()
+                            print("[SYNC] Pulled remote config (no active tasks)")
+                    except Exception:
+                        pass
         except Exception:
             pass
-
 
 # ================= PROXY =================
 def parse_proxy(line):
@@ -254,7 +324,6 @@ def parse_proxy(line):
     if len(parts) == 2 and parts[1].isdigit():
         return f"http://{parts[0]}:{parts[1]}"
     return None
-
 
 async def proxy_fetcher():
     while not STOP_FLAG:
@@ -277,18 +346,16 @@ async def proxy_fetcher():
             pass
         await asyncio.sleep(30)
 
-
 async def get_proxy_for(username):
     async with PROXY_LOCK:
         for proxy, igs in PROXY_ASSIGN.items():
             if username in igs:
                 return proxy
         for proxy in PROXY_POOL:
-            if len(PROXY_ASSIGN.get(proxy, [])) < 2:
+            if len(PROXY_ASSIGN.get(proxy, [])) < MAX_IG_PER_PROXY:
                 PROXY_ASSIGN.setdefault(proxy, []).append(username)
                 return proxy
     return None
-
 
 async def release_proxy_for(username):
     async with PROXY_LOCK:
@@ -298,7 +365,6 @@ async def release_proxy_for(username):
                 if not PROXY_ASSIGN[proxy]:
                     del PROXY_ASSIGN[proxy]
                 return
-
 
 # ================= IG LOOP =================
 async def ig_loop(ig, app):
@@ -314,7 +380,7 @@ async def ig_loop(ig, app):
     consecutive_errors = 0
 
     try:
-        cl = IGClient()
+        cl = make_safe_ig_client()
 
         if ig.get("settings"):
             try:
@@ -322,39 +388,48 @@ async def ig_loop(ig, app):
             except Exception:
                 pass
 
-        # Verify session
         session_ok = False
         try:
-            await asyncio.to_thread(cl.get_timeline_feed)
+            await asyncio.to_thread(cl.account_info)
             session_ok = True
-        except LoginRequired:
+        except (LoginRequired, TwoFactorRequired):
             session_ok = False
-        except Exception:
+        except Exception as e:
+            print(f"[IG] {username} session check: {type(e).__name__}")
             session_ok = True
 
-        if not session_ok and ig.get("password"):
+        if not session_ok:
+            if not ig.get("password"):
+                await notify(f"❌ @{esc(username)} session dead, no password. Delete & re-add.")
+                ig["running"] = False
+                save_config()
+                return
             try:
-                await notify(f"🔄 @{username} session expired, re-login...")
+                await notify(f"🔄 @{esc(username)} session expired, re-login...")
                 await asyncio.to_thread(cl.login, username, ig["password"])
                 ig["settings"] = cl.get_settings()
                 save_config()
-                await notify(f"✅ @{username} session refreshed.")
+                await notify(f"✅ @{esc(username)} session refreshed.")
+            except TwoFactorRequired:
+                await notify(f"🔐 @{esc(username)} 2FA needed. Delete & re-add with 2FA.")
+                ig["running"] = False
+                save_config()
+                return
             except Exception as e:
-                await notify(f"❌ @{username} re-login failed: {type(e).__name__}")
+                await notify(f"❌ @{esc(username)} re-login failed: {esc(type(e).__name__)}")
                 ig["running"] = False
                 save_config()
                 return
 
         IG_CLIENTS[username] = cl
 
-        # Assign proxy
         proxy = await get_proxy_for(username)
         if not proxy:
-            await notify(f"⚠️ @{username} no proxy. Waiting 30s...")
+            await notify(f"⚠️ @{esc(username)} no proxy. Waiting 30s...")
             await asyncio.sleep(30)
             proxy = await get_proxy_for(username)
             if not proxy:
-                await notify(f"❌ @{username} still no proxy, stopping.")
+                await notify(f"❌ @{esc(username)} still no proxy, stopping.")
                 ig["running"] = False
                 save_config()
                 return
@@ -367,7 +442,7 @@ async def ig_loop(ig, app):
             pass
 
         count = ig.get("stats", {}).get("sent", 0)
-        errors = ig.get("stats", {}).get("errors", 0)
+        total_errors = ig.get("stats", {}).get("errors_total", 0)
 
         while not STOP_FLAG and ig.get("running", True):
             try:
@@ -378,67 +453,147 @@ async def ig_loop(ig, app):
                 await asyncio.to_thread(cl.direct_send, msg, [ig["gc_id"]])
                 count += 1
                 consecutive_errors = 0
-                ig["stats"] = {"sent": count, "errors": errors, "last_send": datetime.now().isoformat()}
-                save_config()
+
+                ig["stats"] = {
+                    "sent": count,
+                    "errors_total": total_errors,
+                    "errors_current": 0,
+                    "last_send": datetime.now().isoformat()
+                }
+                save_stats_only()
+
                 await asyncio.sleep(random.uniform(30, 50))
 
             except RateLimitError:
-                await notify(f"⏳ @{username} rate limited. Waiting 2 min...")
+                consecutive_errors += 1
+                await notify(f"⏳ @{esc(username)} rate limited. Waiting 2 min...")
                 await asyncio.sleep(120)
 
             except PleaseWaitFewMinutes:
-                await notify(f"⏳ @{username} please wait 10 min...")
+                consecutive_errors += 1
+                await notify(f"⏳ @{esc(username)} please wait 10 min...")
                 await asyncio.sleep(600)
+
+            except TwoFactorRequired:
+                await notify(f"🔐 @{esc(username)} 2FA needed mid-loop. Stopping.")
+                ig["running"] = False
+                save_config()
+                return
 
             except LoginRequired:
                 try:
                     await asyncio.to_thread(cl.login, username, ig["password"])
                     ig["settings"] = cl.get_settings()
                     save_config()
-                    await notify(f"🔄 @{username} session refreshed mid-loop.")
+                    await notify(f"🔄 @{esc(username)} session refreshed.")
                     continue
+                except TwoFactorRequired:
+                    await notify(f"🔐 @{esc(username)} 2FA needed. Delete & re-add.")
+                    ig["running"] = False
+                    save_config()
+                    return
                 except Exception as e:
-                    await notify(f"❌ @{username} login failed: {type(e).__name__}")
+                    await notify(f"❌ @{esc(username)} re-login failed: {esc(type(e).__name__)}")
                     ig["running"] = False
                     save_config()
                     return
 
-            except Exception as e:
-                errors += 1
-                consecutive_errors += 1
-                ig["stats"] = {"sent": count, "errors": errors, "last_send": datetime.now().isoformat()}
+            except ClientForbiddenError:
+                await notify(f"🚫 @{esc(username)} forbidden (account flagged). Stopping.")
+                ig["running"] = False
                 save_config()
+                return
 
-                # Migrate proxy
-                await release_proxy_for(username)
-                new_proxy = await get_proxy_for(username)
-                if new_proxy:
-                    ig["proxy"] = new_proxy
+            except ClientError as e:
+                msg_lower = str(e).lower()
+                if "thread" in msg_lower and "not found" in msg_lower:
+                    await notify(f"❌ @{esc(username)} GC/thread not found. Delete & re-add.")
+                    ig["running"] = False
                     save_config()
-                    try:
-                        await asyncio.to_thread(cl.set_proxy, new_proxy)
-                    except Exception:
-                        pass
-                    backoff = min(5 * (2 ** min(consecutive_errors - 1, 5)), 120)
-                    if consecutive_errors == 1:
-                        await notify(f"🔀 @{username} proxy migrated ({type(e).__name__})")
-                    await asyncio.sleep(backoff)
-                    continue
-                else:
-                    await notify(f"⚠️ @{username} error: {type(e).__name__}. No proxy. Waiting 30s...")
-                    await asyncio.sleep(30)
+                    return
+
+                total_errors += 1
+                consecutive_errors += 1
+                ig["stats"]["errors_total"] = total_errors
+                ig["stats"]["errors_current"] = consecutive_errors
+                ig["last_error"] = {"type": type(e).__name__, "msg": str(e)[:200], "ts": datetime.now().isoformat()}
+                save_stats_only()
+
+                if is_network_error(e):
+                    await notify(f"🔀 @{esc(username)} network error ({esc(type(e).__name__)}), migrating proxy...")
+                    await release_proxy_for(username)
+                    new_proxy = await get_proxy_for(username)
+                    if new_proxy:
+                        ig["proxy"] = new_proxy
+                        save_config()
+                        try:
+                            await asyncio.to_thread(cl.set_proxy, new_proxy)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(5)
+                        continue
+                    else:
+                        await notify(f"⚠️ @{esc(username)} no proxy available. Waiting 30s...")
+                        await asyncio.sleep(30)
+                        continue
+
+                backoff = min(30 * (2 ** min(consecutive_errors - 1, 4)), 600)
+                await notify(f"⚠️ @{esc(username)} error ({esc(type(e).__name__)}): {esc(str(e)[:100])}")
+                await asyncio.sleep(backoff)
+
+            except Exception as e:
+                total_errors += 1
+                consecutive_errors += 1
+                ig["stats"]["errors_total"] = total_errors
+                ig["stats"]["errors_current"] = consecutive_errors
+                ig["last_error"] = {"type": type(e).__name__, "msg": str(e)[:200], "ts": datetime.now().isoformat()}
+                save_stats_only()
+
+                if is_network_error(e):
+                    await notify(f"🔀 @{esc(username)} network error, migrating...")
+                    await release_proxy_for(username)
+                    new_proxy = await get_proxy_for(username)
+                    if new_proxy:
+                        ig["proxy"] = new_proxy
+                        save_config()
+                        try:
+                            await asyncio.to_thread(cl.set_proxy, new_proxy)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(5)
+                        continue
+                    else:
+                        await asyncio.sleep(30)
+                        continue
+
+                if consecutive_errors >= 3:
+                    await notify(f"🔀 @{esc(username)} 3+ errors, trying new proxy...")
+                    await release_proxy_for(username)
+                    new_proxy = await get_proxy_for(username)
+                    if new_proxy:
+                        ig["proxy"] = new_proxy
+                        save_config()
+                        try:
+                            await asyncio.to_thread(cl.set_proxy, new_proxy)
+                        except Exception:
+                            pass
+                        consecutive_errors = 0
+                        await asyncio.sleep(5)
+                        continue
+
+                await notify(f"❓ @{esc(username)} error: {esc(type(e).__name__)}: {esc(str(e)[:100])}")
+                await asyncio.sleep(30)
 
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        await notify(f"❌ @{username} fatal: {type(e).__name__}: {e}")
+        await notify(f"❌ @{esc(username)} fatal: {esc(type(e).__name__)}: {esc(str(e)[:150])}")
         ig["running"] = False
         save_config()
     finally:
         await release_proxy_for(username)
         IG_CLIENTS.pop(username, None)
         IG_TASKS.pop(username, None)
-
 
 # ================= MENUS =================
 def main_menu(uid):
@@ -454,7 +609,6 @@ def main_menu(uid):
         rows.append([InlineKeyboardButton("👑 Owner Panel", callback_data="owner")])
     return InlineKeyboardMarkup(rows)
 
-
 def owner_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Host New Bot", callback_data="owner_addbot")],
@@ -464,29 +618,22 @@ def owner_menu():
         [InlineKeyboardButton("🔙 Back", callback_data="home")],
     ])
 
-
 def back_menu():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="home")]])
 
-
 def back_owner():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Owner Panel", callback_data="owner")]])
-
 
 async def show_home(q):
     uid = q.from_user.id
     text = (
         f"💗 <b>Dota Bot</b>\n\n"
-        f"Welcome, <b>{q.from_user.first_name}</b>!\n\n"
+        f"Welcome, <b>{esc(q.from_user.first_name)}</b>!\n\n"
         f"<b>Your Limits:</b>\n"
         f"📱 TG Bots: <code>{user_tg_count(uid)}/{MAX_TG_PER_USER}</code>\n"
         f"📸 IG IDs: <code>{user_ig_count(uid)}/{MAX_IG_PER_USER}</code>"
     )
-    try:
-        await q.message.edit_text(text, reply_markup=main_menu(uid), parse_mode="HTML")
-    except Exception:
-        await q.message.reply_text(text, reply_markup=main_menu(uid), parse_mode="HTML")
-
+    await safe_edit(q, text, reply_markup=main_menu(uid))
 
 # ================= START =================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -496,19 +643,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_config()
     text = (
         f"💗 <b>Dota Bot</b>\n\n"
-        f"Welcome, <b>{update.effective_user.first_name}</b>!\n\n"
+        f"Welcome, <b>{esc(update.effective_user.first_name)}</b>!\n\n"
         f"<b>Your Limits:</b>\n"
         f"📱 TG Bots: <code>{user_tg_count(uid)}/{MAX_TG_PER_USER}</code>\n"
         f"📸 IG IDs: <code>{user_ig_count(uid)}/{MAX_IG_PER_USER}</code>"
     )
     await update.message.reply_text(text, reply_markup=main_menu(uid), parse_mode="HTML")
 
-
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     TEMP.pop(update.effective_user.id, None)
     await update.message.reply_text("🛑 Cancelled.", reply_markup=main_menu(update.effective_user.id))
     return ConversationHandler.END
-
 
 # ================= VIEWS =================
 async def cb_tg_view(q):
@@ -520,15 +665,14 @@ async def cb_tg_view(q):
         text = f"📱 <b>Your TG Bots ({len(tokens)}/{MAX_TG_PER_USER})</b>\n\n"
         for i, t in enumerate(tokens, 1):
             bot_id = t["token"].split(":")[0]
-            text += f"{i}. Bot ID: <code>{bot_id}</code>\n"
+            text += f"{i}. Bot ID: <code>{esc(bot_id)}</code>\n"
 
     kb = [[InlineKeyboardButton("➕ Add New Bot", callback_data="add_tg")]]
     for t in tokens:
         bot_id = t["token"].split(":")[0]
         kb.append([InlineKeyboardButton(f"🗑 Remove {bot_id}", callback_data=f"del_tg:{bot_id}")])
     kb.append([InlineKeyboardButton("🔙 Menu", callback_data="home")])
-    await q.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
-
+    await safe_edit(q, text, reply_markup=InlineKeyboardMarkup(kb))
 
 async def cb_ig_view(q):
     uid = q.from_user.id
@@ -540,25 +684,25 @@ async def cb_ig_view(q):
         for ig in igs:
             status = "🟢" if ig["username"] in IG_TASKS else "🔴"
             sent = ig.get("stats", {}).get("sent", 0)
-            errs = ig.get("stats", {}).get("errors", 0)
-            proxy_short = (ig.get("proxy") or "none")[:25]
+            errs = ig.get("stats", {}).get("errors_current", 0)
+            proxy_short = esc((ig.get("proxy") or "none")[:25])
             text += (
-                f"{status} <b>@{ig['username']}</b>\n"
-                f"   ├ GC: <code>{ig['gc_name'][:35]}</code>\n"
+                f"{status} <b>@{esc(ig['username'])}</b>\n"
+                f"   ├ GC: <code>{esc(ig['gc_name'][:35])}</code>\n"
                 f"   ├ Sent: <code>{sent}</code> | Errors: <code>{errs}</code>\n"
                 f"   └ Proxy: <code>{proxy_short}</code>\n\n"
             )
 
     kb = [[InlineKeyboardButton("➕ Add New IG", callback_data="add_ig")]]
     for ig in igs:
+        safe_uname = ig["username"].replace(":", "_")
         if ig["username"] in IG_TASKS:
-            kb.append([InlineKeyboardButton(f"⏹ Stop @{ig['username']}", callback_data=f"stop_ig:{ig['username']}")])
+            kb.append([InlineKeyboardButton(f"⏹ Stop @{ig['username'][:20]}", callback_data=f"stop_ig:{safe_uname}")])
         else:
-            kb.append([InlineKeyboardButton(f"▶️ Start @{ig['username']}", callback_data=f"start_ig:{ig['username']}")])
-        kb.append([InlineKeyboardButton(f"🗑 Delete @{ig['username']}", callback_data=f"del_ig:{ig['username']}")])
+            kb.append([InlineKeyboardButton(f"▶️ Start @{ig['username'][:20]}", callback_data=f"start_ig:{safe_uname}")])
+        kb.append([InlineKeyboardButton(f"🗑 Delete @{ig['username'][:20]}", callback_data=f"del_ig:{safe_uname}")])
     kb.append([InlineKeyboardButton("🔙 Menu", callback_data="home")])
-    await q.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
-
+    await safe_edit(q, text, reply_markup=InlineKeyboardMarkup(kb))
 
 async def cb_dash(q):
     uid = q.from_user.id
@@ -578,17 +722,11 @@ async def cb_dash(q):
         f"📱 All Bots: <code>{len(CONFIG['bots'])}</code>\n"
         f"📸 All IG: <code>{len(CONFIG['ig_ids'])}</code>"
     )
-    await q.message.edit_text(text, reply_markup=back_menu(), parse_mode="HTML")
-
+    await safe_edit(q, text, reply_markup=back_menu())
 
 # ================= OWNER =================
 async def cb_owner(q):
-    await q.message.edit_text(
-        "👑 <b>Owner Panel</b>\n\nManage hosted bots, broadcast, stats.",
-        reply_markup=owner_menu(),
-        parse_mode="HTML"
-    )
-
+    await safe_edit(q, "👑 <b>Owner Panel</b>\n\nManage hosted bots, broadcast, stats.", reply_markup=owner_menu())
 
 async def cb_owner_listbots(q):
     if q.from_user.id != OWNER_ID:
@@ -600,9 +738,8 @@ async def cb_owner_listbots(q):
         main_tag = " 👑" if b.get("is_main") else ""
         status = "🟢" if b["token"] in TG_APPS else "🔴"
         bot_id = b["token"].split(":")[0]
-        text += f"{i}. {status} <code>{bot_id}</code>{main_tag}\n"
-    await q.message.edit_text(text, reply_markup=back_owner(), parse_mode="HTML")
-
+        text += f"{i}. {status} <code>{esc(bot_id)}</code>{main_tag}\n"
+    await safe_edit(q, text, reply_markup=back_owner())
 
 async def cb_owner_addbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -610,42 +747,35 @@ async def cb_owner_addbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("Owner only!", show_alert=True)
         return ConversationHandler.END
     await q.answer()
-    await q.message.edit_text(
-        "➕ <b>Host New Bot</b>\n\nSend bot token:\n\n/cancel to abort.",
-        reply_markup=back_owner(),
-        parse_mode="HTML"
-    )
+    await safe_edit(q, "➕ <b>Host New Bot</b>\n\nSend bot token:\n\n/cancel to abort.", reply_markup=back_owner())
     return S_ADD_BOT
-
 
 async def owner_addbot_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid != OWNER_ID:
         return ConversationHandler.END
     token = update.message.text.strip()
-    if ":" not in token or len(token) < 30:
-        await update.message.reply_text("❌ Invalid token. Try again or /cancel.")
+
+    if not is_valid_token(token):
+        await update.message.reply_text("❌ Invalid token format. Try again or /cancel.")
         return S_ADD_BOT
+
     if any(b["token"] == token for b in CONFIG["bots"]):
         await update.message.reply_text("⚠️ Already hosted!", reply_markup=main_menu(uid))
         return ConversationHandler.END
 
-    CONFIG["bots"].append({
-        "token": token, "owner_id": OWNER_ID,
-        "added_at": datetime.now().isoformat(), "is_main": False
-    })
-    save_config()
-
     ok = await start_bot(token, OWNER_ID, is_main=False)
     if ok:
-        bot_id = token.split(":")[0]
-        await update.message.reply_text(f"✅ Hosted! Bot ID: <code>{bot_id}</code>", reply_markup=main_menu(uid), parse_mode="HTML")
-    else:
-        CONFIG["bots"] = [b for b in CONFIG["bots"] if b["token"] != token]
+        CONFIG["bots"].append({
+            "token": token, "owner_id": OWNER_ID,
+            "added_at": datetime.now().isoformat(), "is_main": False
+        })
         save_config()
-        await update.message.reply_text("❌ Start failed. Token invalid?", reply_markup=main_menu(uid))
+        bot_id = token.split(":")[0]
+        await update.message.reply_text(f"✅ Hosted! Bot ID: <code>{esc(bot_id)}</code>", reply_markup=main_menu(uid), parse_mode="HTML")
+    else:
+        await update.message.reply_text("❌ Start failed. Token invalid or bot offline?", reply_markup=main_menu(uid))
     return ConversationHandler.END
-
 
 async def cb_owner_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -653,28 +783,28 @@ async def cb_owner_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await q.answer("Owner only!", show_alert=True)
         return ConversationHandler.END
     await q.answer()
-    await q.message.edit_text(
-        "📢 <b>Broadcast</b>\n\nSend the message:\n\n/cancel to abort.",
-        reply_markup=back_owner(),
-        parse_mode="HTML"
-    )
+    await safe_edit(q, "📢 <b>Broadcast</b>\n\nSend the message:\n\n/cancel to abort.", reply_markup=back_owner())
     return S_BROADCAST
-
 
 async def owner_broadcast_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return ConversationHandler.END
+
+    main_app = TG_APPS.get(MAIN_BOT_TOKEN)
+    if not main_app:
+        await update.message.reply_text("❌ Main bot not running. Cannot broadcast.", reply_markup=main_menu(OWNER_ID))
+        return ConversationHandler.END
+
     msg = update.message.text
     sent, failed = 0, 0
     for uid_str in list(CONFIG["users"].keys()):
         try:
-            await context.bot.send_message(int(uid_str), f"📢 <b>Broadcast</b>\n\n{msg}", parse_mode="HTML")
+            await main_app.bot.send_message(int(uid_str), f"📢 <b>Broadcast</b>\n\n{esc(msg)}", parse_mode="HTML")
             sent += 1
         except Exception:
             failed += 1
     await update.message.reply_text(f"✅ Sent: {sent}, Failed: {failed}", reply_markup=main_menu(OWNER_ID))
     return ConversationHandler.END
-
 
 # ================= ADD TG =================
 async def cb_add_tg(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -682,47 +812,37 @@ async def cb_add_tg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     uid = q.from_user.id
     if user_tg_count(uid) >= MAX_TG_PER_USER:
-        await q.message.edit_text(
-            f"❌ <b>Dota Capacity Reached</b>\n\nMax {MAX_TG_PER_USER} TG bots.\nRemove one first.",
-            reply_markup=back_menu(), parse_mode="HTML"
-        )
+        await safe_edit(q, f"❌ <b>Dota Capacity Reached</b>\n\nMax {MAX_TG_PER_USER} TG bots.\nRemove one first.", reply_markup=back_menu())
         return ConversationHandler.END
-    await q.message.edit_text(
-        "📱 <b>Add TG Bot</b>\n\nSend bot token from @BotFather.\n\n/cancel to abort.",
-        reply_markup=back_menu(), parse_mode="HTML"
-    )
+    await safe_edit(q, "📱 <b>Add TG Bot</b>\n\nSend bot token from @BotFather.\n\n/cancel to abort.", reply_markup=back_menu())
     return S_TG_TOKEN
-
 
 async def tg_token_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     token = update.message.text.strip()
-    if ":" not in token or len(token) < 30:
-        await update.message.reply_text("❌ Invalid token. Try again or /cancel.")
+
+    if not is_valid_token(token):
+        await update.message.reply_text("❌ Invalid token format. Try again or /cancel.")
         return S_TG_TOKEN
     if any(b["token"] == token for b in CONFIG["bots"]):
         await update.message.reply_text("⚠️ Already added!", reply_markup=main_menu(uid))
         return ConversationHandler.END
 
-    CONFIG["bots"].append({
-        "token": token, "owner_id": uid,
-        "added_at": datetime.now().isoformat(), "is_main": False
-    })
-    save_config()
-
     ok = await start_bot(token, uid, is_main=False)
     if ok:
+        CONFIG["bots"].append({
+            "token": token, "owner_id": uid,
+            "added_at": datetime.now().isoformat(), "is_main": False
+        })
+        save_config()
         bot_id = token.split(":")[0]
         await update.message.reply_text(
-            f"✅ <b>TG Bot Added!</b>\nBot ID: <code>{bot_id}</code>\nHosted: <code>{user_tg_count(uid)}/{MAX_TG_PER_USER}</code>",
+            f"✅ <b>TG Bot Added!</b>\nBot ID: <code>{esc(bot_id)}</code>\nHosted: <code>{user_tg_count(uid)}/{MAX_TG_PER_USER}</code>",
             reply_markup=main_menu(uid), parse_mode="HTML"
         )
     else:
-        CONFIG["bots"] = [b for b in CONFIG["bots"] if b["token"] != token]
-        save_config()
         await update.message.reply_text("❌ Start failed. Token invalid?", reply_markup=main_menu(uid))
     return ConversationHandler.END
-
 
 # ================= ADD IG =================
 async def cb_add_ig(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -730,46 +850,48 @@ async def cb_add_ig(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     uid = q.from_user.id
     if user_ig_count(uid) >= MAX_IG_PER_USER:
-        await q.message.edit_text(
-            f"❌ <b>Dota Capacity Reached</b>\n\nMax {MAX_IG_PER_USER} IG IDs.\nDelete one first.",
-            reply_markup=back_menu(), parse_mode="HTML"
-        )
+        await safe_edit(q, f"❌ <b>Dota Capacity Reached</b>\n\nMax {MAX_IG_PER_USER} IG IDs.\nDelete one first.", reply_markup=back_menu())
         return ConversationHandler.END
     TEMP[uid] = {}
-    await q.message.edit_text(
-        "📸 <b>Add IG ID — Step 1/4</b>\n\nSend IG <b>username</b>:\n\n/cancel to abort.",
-        reply_markup=back_menu(), parse_mode="HTML"
-    )
+    await safe_edit(q, "📸 <b>Add IG ID — Step 1/4</b>\n\nSend IG <b>username</b>:\n\n/cancel to abort.", reply_markup=back_menu())
     return S_IG_USER
-
 
 async def ig_user_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in TEMP:
         TEMP[uid] = {}
-    TEMP[uid]["username"] = update.message.text.strip().lstrip("@")
+    uname = update.message.text.strip().lstrip("@")
+    if not uname:
+        await update.message.reply_text("❌ Username can't be empty. Try again or /cancel.")
+        return S_IG_USER
+    TEMP[uid]["username"] = uname
     await update.message.reply_text(
-        f"📸 <b>Step 2/4</b>\n\nUsername: <code>@{TEMP[uid]['username']}</code>\n\nSend <b>password</b>:",
+        f"📸 <b>Step 2/4</b>\n\nUsername: <code>@{esc(uname)}</code>\n\nSend <b>password</b>:",
         parse_mode="HTML"
     )
     return S_IG_PASS
-
 
 async def ig_pass_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in TEMP:
         await update.message.reply_text("⚠️ Session expired. Use /start.", reply_markup=main_menu(uid))
         return ConversationHandler.END
-    TEMP[uid]["password"] = update.message.text.strip()
+
+    pwd = update.message.text.strip()
+    if not pwd:
+        await update.message.reply_text("❌ Password can't be empty. Try again or /cancel.")
+        return S_IG_PASS
+
+    TEMP[uid]["password"] = pwd
     try:
         await update.message.delete()
     except Exception:
         pass
 
     msg = await update.message.reply_text("⏳ Logging into Instagram...")
-    cl = IGClient()
+    cl = make_safe_ig_client()
     try:
-        await asyncio.to_thread(cl.login, TEMP[uid]["username"], TEMP[uid]["password"])
+        await asyncio.to_thread(cl.login, TEMP[uid]["username"], pwd)
         TEMP[uid]["client"] = cl
         await msg.edit_text("✅ Login success! Fetching GCs...")
         return await show_gcs(msg, uid)
@@ -786,21 +908,22 @@ async def ig_pass_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
         TEMP.pop(uid, None)
         return ConversationHandler.END
     except Exception as e:
-        await msg.edit_text(f"❌ Login failed: {type(e).__name__}. /cancel to abort.")
+        await msg.edit_text(f"❌ Login failed: {esc(type(e).__name__)}. /cancel to abort.", parse_mode="HTML")
         TEMP.pop(uid, None)
         return ConversationHandler.END
-
 
 async def ig_2fa_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in TEMP or "client" not in TEMP[uid]:
         await update.message.reply_text("⚠️ Session expired. Use /start.", reply_markup=main_menu(uid))
         return ConversationHandler.END
+
     code = update.message.text.strip()
     try:
         await update.message.delete()
     except Exception:
         pass
+
     msg = await update.message.reply_text("⏳ Verifying 2FA...")
     cl = TEMP[uid]["client"]
     try:
@@ -808,10 +931,9 @@ async def ig_2fa_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("✅ 2FA success! Fetching GCs...")
         return await show_gcs(msg, uid)
     except Exception as e:
-        await msg.edit_text(f"❌ 2FA failed: {type(e).__name__}. /cancel to abort.")
+        await msg.edit_text(f"❌ 2FA failed: {esc(type(e).__name__)}. /cancel to abort.", parse_mode="HTML")
         TEMP.pop(uid, None)
         return ConversationHandler.END
-
 
 async def show_gcs(msg, uid):
     if uid not in TEMP or "client" not in TEMP[uid]:
@@ -821,7 +943,7 @@ async def show_gcs(msg, uid):
     try:
         threads = await asyncio.to_thread(cl.direct_threads, 10)
     except Exception as e:
-        await msg.edit_text(f"❌ Couldn't fetch GCs: {e}")
+        await msg.edit_text(f"❌ Couldn't fetch GCs: {esc(type(e).__name__)}", parse_mode="HTML")
         TEMP.pop(uid, None)
         return ConversationHandler.END
     if not threads:
@@ -844,7 +966,6 @@ async def show_gcs(msg, uid):
     )
     return S_IG_TEXT
 
-
 async def cb_gc_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -861,21 +982,22 @@ async def cb_gc_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     gc_id = q.data.split(":", 1)[1] if ":" in q.data else ""
     if gc_id not in TEMP[uid]["gcs"]:
-        await q.answer("Session expired", show_alert=True)
+        await q.answer("GC not found", show_alert=True)
         return ConversationHandler.END
 
     TEMP[uid]["gc_id"] = gc_id
     TEMP[uid]["gc_name"] = TEMP[uid]["gcs"][gc_id]
-    await q.message.edit_text(
-        f"✅ GC: <b>{TEMP[uid]['gc_name']}</b>\n\n💬 Send the spam text:",
-        parse_mode="HTML"
-    )
+    await safe_edit(q, f"✅ GC: <b>{esc(TEMP[uid]['gc_name'])}</b>\n\n💬 Send the spam text:", reply_markup=None)
     return S_IG_TEXT
-
 
 async def ig_text_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text.strip()
+
+    if not text:
+        await update.message.reply_text("❌ Text can't be empty. Send text or /cancel.")
+        return S_IG_TEXT
+
     data = TEMP.get(uid)
     if not data or "gc_id" not in data or "client" not in data:
         await update.message.reply_text("⚠️ Session expired. Use /start.", reply_markup=main_menu(uid))
@@ -893,15 +1015,15 @@ async def ig_text_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "running": True,
         "proxy": None,
         "added_at": datetime.now().isoformat(),
-        "stats": {"sent": 0, "errors": 0}
+        "stats": {"sent": 0, "errors_total": 0, "errors_current": 0}
     }
     CONFIG["ig_ids"].append(ig_entry)
     save_config()
     TEMP.pop(uid, None)
 
     await update.message.reply_text(
-        f"✅ <b>IG @{ig_entry['username']} Added!</b>\n\n"
-        f"📁 GC: <code>{ig_entry['gc_name']}</code>\n"
+        f"✅ <b>IG @{esc(ig_entry['username'])} Added!</b>\n\n"
+        f"📁 GC: <code>{esc(ig_entry['gc_name'])}</code>\n"
         f"▶️ Starting loop...",
         reply_markup=main_menu(uid), parse_mode="HTML"
     )
@@ -909,32 +1031,44 @@ async def ig_text_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     IG_TASKS[ig_entry["username"]] = asyncio.create_task(ig_loop(ig_entry, context.application))
     return ConversationHandler.END
 
-
 # ================= CONTROLS =================
 async def cb_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
-    uid = q.from_user.id
     parts = q.data.split(":", 1)
     if len(parts) != 2:
+        await q.answer("Invalid", show_alert=True)
         return
-    action, username = parts
+    action, safe_uname = parts
+    uid = q.from_user.id
 
-    ig = next((ig for ig in CONFIG["ig_ids"] if ig["username"] == username and ig["owner_id"] == uid), None)
+    ig = next((ig for ig in CONFIG["ig_ids"]
+               if ig["username"].replace(":", "_") == safe_uname and ig["owner_id"] == uid), None)
     if not ig:
         await q.answer("Not found", show_alert=True)
         return
 
+    await q.answer()
+
+    username = ig["username"]
     if action == "stop_ig":
         task = IG_TASKS.pop(username, None)
         if task:
             task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
         ig["running"] = False
         save_config()
         await release_proxy_for(username)
         await cb_ig_view(q)
     elif action == "start_ig":
-        if username not in IG_TASKS:
+        existing = IG_TASKS.get(username)
+        if existing and not existing.done():
+            pass
+        else:
+            if existing:
+                IG_TASKS.pop(username, None)
             ig["running"] = True
             save_config()
             IG_TASKS[username] = asyncio.create_task(ig_loop(ig, context.application))
@@ -943,56 +1077,57 @@ async def cb_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task = IG_TASKS.pop(username, None)
         if task:
             task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
         await release_proxy_for(username)
         CONFIG["ig_ids"] = [x for x in CONFIG["ig_ids"] if not (x["username"] == username and x["owner_id"] == uid)]
         save_config()
         await cb_ig_view(q)
 
-
 async def cb_del_tg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
-    uid = q.from_user.id
     parts = q.data.split(":", 1)
     if len(parts) != 2:
+        await q.answer("Invalid", show_alert=True)
         return
     bot_id = parts[1]
+    uid = q.from_user.id
     to_del = next((b for b in CONFIG["bots"] if b["owner_id"] == uid and b["token"].split(":")[0] == bot_id and not b.get("is_main")), None)
-    if to_del:
-        if to_del["token"] in TG_APPS:
-            try:
-                await TG_APPS[to_del["token"]].updater.stop()
-                await TG_APPS[to_del["token"]].stop()
-                del TG_APPS[to_del["token"]]
-            except Exception:
-                pass
-        CONFIG["bots"] = [b for b in CONFIG["bots"] if b["token"] != to_del["token"]]
-        save_config()
+    if not to_del:
+        await q.answer("Not found", show_alert=True)
+        return
+    await q.answer()
+    if to_del["token"] in TG_APPS:
+        try:
+            await TG_APPS[to_del["token"]].updater.stop()
+            await TG_APPS[to_del["token"]].stop()
+            del TG_APPS[to_del["token"]]
+        except Exception:
+            pass
+    CONFIG["bots"] = [b for b in CONFIG["bots"] if b["token"] != to_del["token"]]
+    save_config()
     await cb_tg_view(q)
 
-
-async def cb_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+async def cb_clean(q):
     kb = [
         [InlineKeyboardButton("⚠️ Yes, DELETE", callback_data="clean_yes")],
         [InlineKeyboardButton("🔙 No, Go Back", callback_data="home")],
     ]
-    await q.message.edit_text(
-        "⚠️ <b>Delete ALL your data?</b>\n\n• All IG IDs\n• All your hosted bots\n• All stats\n\n<b>Cannot be undone.</b>",
-        reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML"
-    )
+    await safe_edit(q, "⚠️ <b>Delete ALL your data?</b>\n\n• All IG IDs\n• All your hosted bots\n• All stats\n\n<b>Cannot be undone.</b>", reply_markup=InlineKeyboardMarkup(kb))
 
-
-async def cb_clean_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+async def cb_clean_yes(q):
     uid = q.from_user.id
 
     for ig in [x for x in CONFIG["ig_ids"] if x["owner_id"] == uid]:
         task = IG_TASKS.pop(ig["username"], None)
         if task:
             task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
         await release_proxy_for(ig["username"])
 
     for b in [x for x in CONFIG["bots"] if x["owner_id"] == uid and not x.get("is_main")]:
@@ -1009,38 +1144,53 @@ async def cb_clean_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     CONFIG["users"].pop(str(uid), None)
     save_config()
 
-    await q.message.edit_text("🧹 Cleaned! Fresh start.", reply_markup=main_menu(uid), parse_mode="HTML")
+    await safe_edit(q, "🧹 Cleaned! Fresh start.", reply_markup=main_menu(uid))
 
+# ================= WIZARD EXIT =================
+async def cmd_exit_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    TEMP.pop(uid, None)
+    await q.answer()
+    d = q.data
+    if d == "home":
+        await show_home(q)
+    elif d == "tg_view":
+        await cb_tg_view(q)
+    elif d == "ig_view":
+        await cb_ig_view(q)
+    elif d == "dash":
+        await cb_dash(q)
+    elif d == "clean":
+        await cb_clean(q)
+    elif d == "owner":
+        await cb_owner(q)
+    return ConversationHandler.END
 
 # ================= ROUTER =================
 async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     d = q.data
 
+    await q.answer()
+
     if d == "home":
-        await q.answer()
         await show_home(q)
     elif d == "tg_view":
-        await q.answer()
         await cb_tg_view(q)
     elif d == "ig_view":
-        await q.answer()
         await cb_ig_view(q)
     elif d == "dash":
-        await q.answer()
         await cb_dash(q)
     elif d == "clean":
-        await q.answer()
         await cb_clean(q)
     elif d == "clean_yes":
-        await q.answer()
         await cb_clean_yes(q)
     elif d == "owner":
-        await q.answer()
         await cb_owner(q)
     elif d == "owner_listbots":
+        # Bug #27 fix: call function directly (it answers itself)
         await cb_owner_listbots(q)
-
 
 # ================= BOT BUILDER =================
 def build_app(token, owner_id, is_main=False):
@@ -1066,8 +1216,14 @@ def build_app(token, owner_id, is_main=False):
             S_ADD_BOT: [MessageHandler(filters.TEXT & ~filters.COMMAND, owner_addbot_received)],
             S_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, owner_broadcast_received)],
         },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
-        per_user=True, per_chat=True, per_message=False,
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            CommandHandler("start", cmd_cancel),
+            CallbackQueryHandler(cmd_exit_wizard, pattern="^(home|tg_view|ig_view|dash|clean|owner)$"),
+        ],
+        per_user=True,
+        per_chat=True,
+        per_message=False,
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1077,7 +1233,6 @@ def build_app(token, owner_id, is_main=False):
     app.add_handler(CallbackQueryHandler(cb_control, pattern="^(stop_ig|start_ig|del_ig):.+$"))
     app.add_handler(CallbackQueryHandler(cb_del_tg, pattern="^del_tg:.+$"))
     return app
-
 
 async def start_bot(token, owner_id, is_main=False):
     if token in TG_APPS:
@@ -1107,22 +1262,26 @@ async def start_bot(token, owner_id, is_main=False):
                 pass
         return False
 
-
 # ================= MAIN =================
 async def main():
-    global STOP_FLAG
+    global STOP_FLAG, GITHUB_USER, REPO_NAME
+
+    cleanup_session_files()
 
     if not os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(default_config(), f, indent=2)
     load_config()
 
-    # Ensure main bot in config
-    if not any(b.get("is_main") for b in CONFIG["bots"]):
+    main_entries = [b for b in CONFIG["bots"] if b.get("is_main")]
+    if not main_entries:
         CONFIG["bots"].insert(0, {
             "token": MAIN_BOT_TOKEN, "owner_id": OWNER_ID,
             "added_at": datetime.now().isoformat(), "is_main": True
         })
+        save_config()
+    elif main_entries[0].get("token") != MAIN_BOT_TOKEN:
+        main_entries[0]["token"] = MAIN_BOT_TOKEN
         save_config()
 
     print("🚀 Dota Bot starting...")
@@ -1131,25 +1290,21 @@ async def main():
     asyncio.create_task(gh_sync_loop())
     await gh_bootstrap()
 
-    # Start main bot first
     await start_bot(MAIN_BOT_TOKEN, OWNER_ID, is_main=True)
 
-    # Start user bots
     for b in CONFIG["bots"]:
         if not b.get("is_main"):
             await start_bot(b["token"], b["owner_id"], is_main=False)
 
-    # Restart running IG loops
     for ig in CONFIG["ig_ids"]:
         if ig.get("running"):
-            owner_app = None
-            for b in CONFIG["bots"]:
-                if b["owner_id"] == ig["owner_id"]:
-                    owner_app = TG_APPS.get(b["token"])
-                    if owner_app:
-                        break
+            owner_app = find_owner_app(ig["owner_id"])
             if owner_app:
                 IG_TASKS[ig["username"]] = asyncio.create_task(ig_loop(ig, owner_app))
+            else:
+                print(f"[IG] {ig['username']} running but no owner app — setting stopped")
+                ig["running"] = False
+                save_config()
 
     print(f"✅ {len(TG_APPS)} bots running, {len(CONFIG['ig_ids'])} IG IDs loaded")
 
@@ -1171,7 +1326,6 @@ async def main():
                 await GH_SESSION.close()
             except Exception:
                 pass
-
 
 if __name__ == "__main__":
     try:
